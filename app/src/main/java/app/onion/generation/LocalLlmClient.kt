@@ -1,17 +1,28 @@
 package app.onion.generation
 
 import android.content.Context
-import com.google.mediapipe.tasks.genai.llminference.LlmInference
+import com.google.ai.edge.litertlm.Backend
+import com.google.ai.edge.litertlm.Content
+import com.google.ai.edge.litertlm.Contents
+import com.google.ai.edge.litertlm.ConversationConfig
+import com.google.ai.edge.litertlm.Engine
+import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.LogSeverity
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.io.File
 
 interface LocalLlmClient {
     suspend fun generateTitle(prompt: String): String
-    suspend fun generateHtml(prompt: String): String
+    suspend fun generateHtml(
+        prompt: String,
+        onPartialHtml: (String) -> Unit = {},
+    ): String
 }
 
-class MediaPipeLocalLlmClient(
+class LiteRtLocalLlmClient(
     context: Context,
 ) : LocalLlmClient {
     private val appContext = context.applicationContext
@@ -26,39 +37,61 @@ class MediaPipeLocalLlmClient(
             ?: "새 앱"
     }
 
-    override suspend fun generateHtml(prompt: String): String {
-        return extractHtml(generate(prompt, maxTokens = 4096))
+    override suspend fun generateHtml(
+        prompt: String,
+        onPartialHtml: (String) -> Unit,
+    ): String {
+        return extractHtml(generate(prompt, maxTokens = 4096, onPartialHtml = onPartialHtml))
     }
 
     private suspend fun generate(
         prompt: String,
         maxTokens: Int,
+        onPartialHtml: (String) -> Unit = {},
     ): String = withContext(Dispatchers.IO) {
-        val modelFile = findModelFile()
-            ?: error("앱 생성 도구 모델 파일이 없습니다. 설정에서 앱 생성 도구를 먼저 받아주세요.")
+        withTimeout(60 * 60 * 1000L) {
+            val modelFile = findModelFile()
+                ?: error("앱 생성 도구 모델 파일이 없습니다. 설정에서 앱 생성 도구를 먼저 받아주세요.")
 
-        val options = LlmInference.LlmInferenceOptions.builder()
-            .setModelPath(modelFile.absolutePath)
-            .setMaxTokens(maxTokens)
-            .setMaxTopK(64)
-            .build()
+            if (modelFile.extension != "litertlm") {
+                error("현재 앱 생성 도구는 LiteRT-LM 모델 파일만 사용할 수 있습니다.")
+            }
 
-        LlmInference.createFromOptions(appContext, options).use { inference ->
-            inference.generateResponse(prompt)
+            Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
+            val config = EngineConfig(
+                modelPath = modelFile.absolutePath,
+                backend = Backend.CPU(),
+                maxNumTokens = maxTokens,
+                cacheDir = appContext.cacheDir.absolutePath,
+            )
+            Engine(config).use { engine ->
+                engine.initialize()
+                val conversationConfig = ConversationConfig(
+                    systemInstruction = Contents.of("You create concise, correct, self-contained HTML apps."),
+                )
+                engine.createConversation(conversationConfig).use { conversation ->
+                    val builder = StringBuilder()
+                    conversation.sendMessageAsync(prompt).collect { message ->
+                        val text = message.textContent()
+                        builder.append(text)
+                        builder.toString().asPreviewHtmlOrNull()?.let(onPartialHtml)
+                    }
+                    builder.toString()
+                }
+            }
         }
     }
 
     private fun findModelFile(): File? {
         val modelDir = File(appContext.filesDir, "models/app_creation_tool")
         return listOf(
-            File(modelDir, "model.task"),
             File(modelDir, "model.litertlm"),
         ).firstOrNull { it.exists() && it.length() > 0L }
     }
 
     private fun extractHtml(raw: String): String {
         val fenced = Regex("```(?:html)?\\s*([\\s\\S]*?)```").find(raw)?.groupValues?.getOrNull(1)
-        val candidate = fenced ?: raw
+        val candidate = (fenced ?: raw).stripModelMarkers()
         val start = candidate.indexOf("<!doctype", ignoreCase = true).takeIf { it >= 0 }
             ?: candidate.indexOf("<html", ignoreCase = true).takeIf { it >= 0 }
             ?: 0
@@ -67,6 +100,40 @@ class MediaPipeLocalLlmClient(
             candidate.substring(start, endHtml + "</html>".length).trim()
         } else {
             candidate.substring(start).trim()
+        }
+    }
+
+    private fun com.google.ai.edge.litertlm.Message.textContent(): String {
+        return contents.contents.joinToString(separator = "") { content ->
+            when (content) {
+                is Content.Text -> content.text
+                else -> ""
+            }
+        }
+    }
+
+    private fun String.asPreviewHtmlOrNull(): String? {
+        val clean = stripModelMarkers()
+        val start = clean.indexOf("<!doctype", ignoreCase = true).takeIf { it >= 0 }
+            ?: clean.indexOf("<html", ignoreCase = true).takeIf { it >= 0 }
+            ?: return null
+        return clean.substring(start).asRenderablePartialHtml()
+    }
+
+    private fun String.stripModelMarkers(): String {
+        return replace("<|turn>model", "")
+            .replace("<|turn>user", "")
+            .replace("<|end_of_turn|>", "")
+            .replace("<end_of_turn>", "")
+    }
+
+    private fun String.asRenderablePartialHtml(): String {
+        val trimmed = trim()
+        val hasHtmlEnd = trimmed.contains("</html>", ignoreCase = true)
+        if (hasHtmlEnd) return trimmed
+        return when {
+            trimmed.contains("<html", ignoreCase = true) -> "$trimmed\n</html>"
+            else -> "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head><body>$trimmed</body></html>"
         }
     }
 }
@@ -86,7 +153,10 @@ class LocalLlmNotConnectedClient : LocalLlmClient {
             ?: "새 앱"
     }
 
-    override suspend fun generateHtml(prompt: String): String {
+    override suspend fun generateHtml(
+        prompt: String,
+        onPartialHtml: (String) -> Unit,
+    ): String {
         return localLlmMissingHtml(prompt)
     }
 

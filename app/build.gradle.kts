@@ -39,6 +39,6 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
-    implementation("com.google.mediapipe:tasks-genai:0.10.27")
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.13.1")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

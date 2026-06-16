@@ -1,90 +1,264 @@
 package app.onion.generation
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
 import android.content.SharedPreferences
+import android.os.Build
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.ArrayDeque
 import java.util.UUID
 
 class AppGenerationManager(
+    context: Context,
     private val preferences: SharedPreferences,
     private val localLlmClient: LocalLlmClient = LocalLlmNotConnectedClient(),
 ) {
+    private val appContext = context.applicationContext
+    private val notificationManager = appContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val queue = ArrayDeque<GenerationWork>()
+    private var activeJob: Job? = null
+    private var activeWork: GenerationWork? = null
+
     private val _state = MutableStateFlow(
         AppGenerationState(apps = loadSavedApps()),
     )
     val state: StateFlow<AppGenerationState> = _state.asStateFlow()
 
-    suspend fun start(
+    fun enqueue(
         request: AppGenerationRequest,
         replacingAppId: String? = null,
-    ) {
-        if (_state.value.current?.status == GenerationStatus.Generating) return
-
-        val title = runCatching {
-            localLlmClient.generateTitle(HtmlAppPrompt.titlePrompt(request))
-        }.getOrElse {
-            fallbackTitle(request.prompt)
-        }
+    ): String {
+        val draft = GeneratedAppDraft(
+            id = replacingAppId ?: UUID.randomUUID().toString(),
+            title = "",
+            prompt = request.prompt,
+            category = request.category,
+            style = request.style,
+            useLocalStorage = request.useLocalStorage,
+            html = "",
+            status = GenerationStatus.Queued,
+            progressLabel = "대기 중이에요",
+        )
+        queue.addLast(GenerationWork(draft.id, request, replacingAppId))
         _state.update {
             it.copy(
-                current = GeneratedAppDraft(
-                    id = replacingAppId ?: UUID.randomUUID().toString(),
-                    title = title,
-                    prompt = request.prompt,
-                    category = request.category,
-                    style = request.style,
-                    useLocalStorage = request.useLocalStorage,
-                    html = initialHtml(title),
-                    status = GenerationStatus.Generating,
-                    progressLabel = "앱 구조를 설계하는 중",
-                ),
+                drafts = it.drafts + draft,
+                current = draft,
             )
         }
+        processNextIfIdle()
+        return draft.id
+    }
+
+    fun cancelGeneration(draftId: String) {
+        queue.removeAll { it.id == draftId }
+        if (activeWork?.id == draftId) {
+            activeJob?.cancel()
+            activeJob = null
+            activeWork = null
+        }
+        notificationManager.cancel(draftId.notificationId())
+        _state.update { state ->
+            val drafts = state.drafts.filterNot { it.id == draftId }
+            state.copy(
+                drafts = drafts,
+                current = state.current?.takeUnless { it.id == draftId } ?: drafts.firstOrNull(),
+            )
+        }
+        processNextIfIdle()
+    }
+
+    fun draftById(draftId: String): GeneratedAppDraft? {
+        return _state.value.drafts.firstOrNull { it.id == draftId }
+    }
+
+    private fun processNextIfIdle() {
+        if (activeJob?.isActive == true) return
+        val next = if (queue.isEmpty()) return else queue.removeFirst()
+        activeWork = next
+        activeJob = scope.launch {
+            runCatching {
+                runGeneration(next)
+            }.onFailure { error ->
+                updateDraft(next.id) {
+                    it.copy(
+                        html = errorHtml(it.title, error.message ?: "앱 생성을 완료하지 못했습니다.", it.prompt),
+                        status = GenerationStatus.Failed,
+                        progressLabel = "생성 실패",
+                    )
+                }
+                postGenerationNotification(next.id)
+            }
+            activeWork = null
+            activeJob = null
+            processNextIfIdle()
+        }
+    }
+
+    private suspend fun runGeneration(work: GenerationWork) {
+        val request = work.request
+        updateDraft(work.id) {
+            it.copy(status = GenerationStatus.Generating, progressLabel = "AI가 앱 이름을 정하고 있어요")
+        }
+        postGenerationNotification(work.id)
+
+        updateDraft(work.id) {
+            it.copy(progressLabel = "AI가 계획 중이에요")
+        }
+        postGenerationNotification(work.id)
 
         delay(350)
-        _state.update {
-            it.copy(current = it.current?.copy(progressLabel = "요청을 앱 생성 도구에 전달하는 중"))
+        updateDraft(work.id) {
+            it.copy(progressLabel = "요청을 앱 생성 도구에 전달했어요")
         }
 
         val htmlPrompt = HtmlAppPrompt.build(request)
         val htmlResult = runCatching {
-            localLlmClient.generateHtml(htmlPrompt)
+            localLlmClient.generateHtml(htmlPrompt) { partialHtml ->
+                val label = progressLabelFor(partialHtml)
+                val partialTitle = extractTitle(partialHtml)
+                updateDraft(work.id) {
+                    it.copy(
+                        title = partialTitle ?: it.title,
+                        html = partialHtml,
+                        progressLabel = label,
+                        status = GenerationStatus.Generating,
+                    )
+                }
+                postGenerationNotification(work.id)
+            }
         }
         val html = htmlResult.getOrElse { error ->
             errorHtml(
-                title = title,
+                title = draftById(work.id)?.title?.takeIf { it.isNotBlank() } ?: fallbackTitle(request.prompt),
                 message = error.message ?: "앱 생성 도구를 실행할 수 없습니다.",
                 prompt = request.prompt,
             )
         }
+        val title = extractTitle(html)
+            ?: draftById(work.id)?.title?.takeIf { it.isNotBlank() }
+            ?: fallbackTitle(request.prompt)
 
-        _state.update {
-            it.copy(
-                current = it.current?.copy(
-                    html = html,
-                    progressLabel = "HTML 앱을 미리보기에 반영하는 중",
-                    status = GenerationStatus.Generating,
-                ),
-            )
-        }
+        val finished = draftById(work.id)?.copy(
+            title = title,
+            html = html,
+            status = if (htmlResult.isSuccess) GenerationStatus.Done else GenerationStatus.Failed,
+            progressLabel = if (htmlResult.isSuccess) "완성됨" else "앱 생성 도구 연결 필요",
+        ) ?: return
 
         _state.update { state ->
-            val finished = state.current?.copy(
-                status = if (htmlResult.isSuccess) GenerationStatus.Done else GenerationStatus.Failed,
-                progressLabel = if (htmlResult.isSuccess) "완성됨" else "앱 생성 도구 연결 필요",
-            )
-            val apps = if (finished == null || finished.status == GenerationStatus.Failed) state.apps else {
+            val apps = if (finished.status == GenerationStatus.Failed) state.apps else {
                 listOf(finished.toSavedApp()) + state.apps.filterNot { it.id == finished.id }
             }
             saveApps(apps)
-            state.copy(current = finished, apps = apps)
+            state.copy(
+                current = finished,
+                drafts = state.drafts.map { if (it.id == finished.id) finished else it },
+                apps = apps,
+            )
+        }
+        postGenerationNotification(work.id)
+    }
+
+    private fun updateDraft(
+        id: String,
+        transform: (GeneratedAppDraft) -> GeneratedAppDraft,
+    ) {
+        _state.update { state ->
+            val drafts = state.drafts.map { if (it.id == id) transform(it) else it }
+            state.copy(
+                drafts = drafts,
+                current = state.current?.let { current ->
+                    drafts.firstOrNull { it.id == current.id } ?: current
+                } ?: drafts.firstOrNull { it.id == id },
+            )
         }
     }
+
+    private fun progressLabelFor(html: String): String {
+        val lower = html.lowercase()
+        return when {
+            "<script" in lower -> "기능 연결 중"
+            "<body" in lower -> "화면 생성 중"
+            "<style" in lower || "<css" in lower -> "디자인 적용 중"
+            else -> "AI가 계획 중이에요"
+        }
+    }
+
+    private fun extractTitle(html: String): String? {
+        return Regex("<title[^>]*>([\\s\\S]*?)</title>", RegexOption.IGNORE_CASE)
+            .find(html)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.replace(Regex("\\s+"), " ")
+            ?.trim()
+            ?.take(32)
+            ?.takeIf { it.isNotBlank() }
+    }
+
+    private fun postGenerationNotification(draftId: String) {
+        val draft = draftById(draftId) ?: return
+        createNotificationChannel()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            appContext.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        val title = when (draft.status) {
+            GenerationStatus.Queued -> "${draft.displayTitle()} 대기 중"
+            GenerationStatus.Generating -> "${draft.displayTitle()} 만드는 중"
+            GenerationStatus.Done -> "${draft.displayTitle()} 생성 완료"
+            GenerationStatus.Failed -> "${draft.displayTitle()} 생성 실패"
+        }
+        val notification = Notification.Builder(appContext, NOTIFICATION_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setContentTitle(title)
+            .setContentText(draft.progressLabel)
+            .setOngoing(draft.status == GenerationStatus.Queued || draft.status == GenerationStatus.Generating)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
+            .setProgress(0, 0, draft.status == GenerationStatus.Queued || draft.status == GenerationStatus.Generating)
+            .build()
+        notificationManager.notify(draftId.notificationId(), notification)
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            notificationManager.createNotificationChannel(
+                NotificationChannel(
+                    NOTIFICATION_CHANNEL_ID,
+                    "앱 생성",
+                    NotificationManager.IMPORTANCE_LOW,
+                ),
+            )
+        }
+    }
+
+    private fun String.notificationId(): Int = hashCode()
+
+    private fun GeneratedAppDraft.displayTitle(): String {
+        return title.ifBlank { "새 앱" }
+    }
+
+    private data class GenerationWork(
+        val id: String,
+        val request: AppGenerationRequest,
+        val replacingAppId: String?,
+    )
 
     fun deleteApp(appId: String) {
         _state.update { state ->
@@ -708,11 +882,13 @@ class AppGenerationManager(
 
     companion object {
         private const val KEY_APPS = "generated_apps"
+        private const val NOTIFICATION_CHANNEL_ID = "app_generation"
     }
 }
 
 data class AppGenerationState(
     val apps: List<SavedMiniApp> = emptyList(),
+    val drafts: List<GeneratedAppDraft> = emptyList(),
     val current: GeneratedAppDraft? = null,
 )
 
@@ -761,6 +937,7 @@ data class HtmlUpdate(
 )
 
 enum class GenerationStatus {
+    Queued,
     Generating,
     Done,
     Failed,

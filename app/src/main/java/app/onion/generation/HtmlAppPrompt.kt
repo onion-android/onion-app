@@ -12,6 +12,9 @@ object HtmlAppPrompt {
 
             Requirements:
             - Return only one complete HTML document.
+            - Start the answer immediately with <!doctype html> or <html>.
+            - Put a short Korean app name in the <title> tag before writing the body.
+            - Do not include Markdown fences, explanation, planning text, or comments outside the HTML.
             - Include all CSS and JavaScript inline.
             - Do not use external scripts, CDNs, images, or network calls.
             - The app must directly satisfy the user's request, not a generic template.

@@ -1,6 +1,7 @@
 package app.onion
 
 import android.app.ActivityManager
+import android.os.Build
 import android.content.Context
 import android.os.Bundle
 import android.webkit.WebView
@@ -35,6 +36,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -50,7 +52,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -73,28 +74,31 @@ import app.onion.generation.AppGenerationState
 import app.onion.generation.AppStyle
 import app.onion.generation.GenerationStatus
 import app.onion.generation.GeneratedAppDraft
-import app.onion.generation.MediaPipeLocalLlmClient
+import app.onion.generation.LiteRtLocalLlmClient
 import app.onion.generation.SavedMiniApp
 import app.onion.ui.OnionTheme
-import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1001)
+        }
         setContent {
             val context = LocalContext.current
             val preferences = remember { context.getSharedPreferences("onion", Context.MODE_PRIVATE) }
-            val appScope = rememberCoroutineScope()
             val manager = remember {
                 AppCreationToolManager(
+                    context = context,
                     recommendedModel = AppCreationToolModel.recommendFor(context.deviceMemoryGb()),
                 )
             }
             val generationManager = remember {
                 AppGenerationManager(
+                    context = context,
                     preferences = preferences,
-                    localLlmClient = MediaPipeLocalLlmClient(context),
+                    localLlmClient = LiteRtLocalLlmClient(context),
                 )
             }
             val toolState by manager.state.collectAsState()
@@ -115,11 +119,12 @@ class MainActivity : ComponentActivity() {
                 )
             }
             var selectedApp by remember { mutableStateOf<SavedMiniApp?>(null) }
+            var selectedDraftId by remember { mutableStateOf<String?>(null) }
             var editingApp by remember { mutableStateOf<SavedMiniApp?>(null) }
             val strings = remember(appLanguage) { OnionStrings.forLanguage(appLanguage) }
 
             OnionTheme(themeMode = themeMode) {
-                BackHandler(enabled = destination == AppDestination.Preview || destination == AppDestination.Create || destination == AppDestination.Settings) {
+                BackHandler(enabled = destination == AppDestination.Preview || destination == AppDestination.Create || destination == AppDestination.Settings || destination == AppDestination.Market) {
                     generationManager.clearCurrent()
                     selectedApp = null
                     editingApp = null
@@ -159,8 +164,14 @@ class MainActivity : ComponentActivity() {
                                 editingApp = null
                                 destination = AppDestination.Create
                             },
+                        onOpenDraft = {
+                            selectedDraftId = it.id
+                            selectedApp = null
+                            destination = AppDestination.Preview
+                        },
                         onOpenApp = {
                             selectedApp = it
+                            selectedDraftId = null
                             destination = AppDestination.Preview
                         },
                         onEditApp = {
@@ -168,6 +179,8 @@ class MainActivity : ComponentActivity() {
                             destination = AppDestination.Create
                         },
                         onDeleteApp = generationManager::deleteApp,
+                            onCancelDraft = generationManager::cancelGeneration,
+                        onOpenMarket = { destination = AppDestination.Market },
                         onOpenSettings = { destination = AppDestination.Settings },
                     )
 
@@ -180,17 +193,24 @@ class MainActivity : ComponentActivity() {
                         onGenerate = { request ->
                             val replacingId = editingApp?.id
                             selectedApp = null
+                            val draftId = generationManager.enqueue(request, replacingId)
+                            selectedDraftId = draftId
                             destination = AppDestination.Preview
-                            appScope.launch { generationManager.start(request, replacingId) }
                         },
                     )
 
                     AppDestination.Preview -> AppPreviewScreen(
-                        draft = generationState.current,
+                        draft = selectedDraftId?.let { generationManager.draftById(it) } ?: generationState.current,
                         savedApp = selectedApp,
+                        onCancelDraft = {
+                            selectedDraftId?.let(generationManager::cancelGeneration)
+                            selectedDraftId = null
+                            destination = AppDestination.Home
+                        },
                         onBack = {
                             generationManager.clearCurrent()
                             selectedApp = null
+                            selectedDraftId = null
                             destination = AppDestination.Home
                         },
                     )
@@ -211,6 +231,13 @@ class MainActivity : ComponentActivity() {
                         onSelectModel = manager::selectModel,
                         onStartDownload = manager::startDownloadInBackground,
                         onBack = { destination = AppDestination.Home },
+                        onOpenHome = { destination = AppDestination.Home },
+                        onOpenMarket = { destination = AppDestination.Market },
+                    )
+
+                    AppDestination.Market -> MarketScreen(
+                        onOpenHome = { destination = AppDestination.Home },
+                        onOpenSettings = { destination = AppDestination.Settings },
                     )
                 }
             }
@@ -224,6 +251,7 @@ private enum class AppDestination {
     Create,
     Preview,
     Settings,
+    Market,
 }
 
 private inline fun <reified T : Enum<T>> android.content.SharedPreferences.enumValue(
@@ -262,10 +290,9 @@ private fun OnionOnboarding(
     toolState: AppCreationToolState,
     onLanguageSelected: (AppLanguage) -> Unit,
     onThemeSelected: (AppThemeMode) -> Unit,
-    onDownloadTool: suspend () -> Unit,
+    onDownloadTool: () -> Unit,
     onSkipTool: () -> Unit,
 ) {
-    val scope = rememberCoroutineScope()
     var step by remember { mutableIntStateOf(0) }
     var introPage by remember { mutableIntStateOf(0) }
     val introPages = strings.introPages
@@ -322,7 +349,7 @@ private fun OnionOnboarding(
                             step < 2 -> step += 1
                             step == 2 && introPage < introPages.lastIndex -> introPage += 1
                             step == 2 -> step += 1
-                            else -> scope.launch { onDownloadTool() }
+                            else -> onDownloadTool()
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
@@ -566,17 +593,29 @@ private fun OnionHomeScreen(
     toolState: AppCreationToolState,
     generationState: AppGenerationState,
     onAddApp: () -> Unit,
+    onOpenDraft: (GeneratedAppDraft) -> Unit,
     onOpenApp: (SavedMiniApp) -> Unit,
     onEditApp: (SavedMiniApp) -> Unit,
     onDeleteApp: (String) -> Unit,
+    onCancelDraft: (String) -> Unit,
+    onOpenMarket: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
     val scrollState = rememberScrollState()
-    val hasApps = generationState.apps.isNotEmpty()
+    val activeDrafts = generationState.drafts.filter { it.status == GenerationStatus.Queued || it.status == GenerationStatus.Generating }
+    val hasApps = generationState.apps.isNotEmpty() || activeDrafts.isNotEmpty()
     val canCreate = toolState.canCreateApp
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
+        bottomBar = {
+            OnionBottomBar(
+                selected = AppDestination.Home,
+                onOpenMarket = onOpenMarket,
+                onOpenHome = {},
+                onOpenSettings = onOpenSettings,
+            )
+        },
     ) { padding ->
         Column(
             modifier = Modifier
@@ -591,9 +630,6 @@ private fun OnionHomeScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 OnionHeader(strings = strings, modifier = Modifier.weight(1f))
-                OutlinedButton(onClick = onOpenSettings) {
-                    Text(text = "설정")
-                }
             }
 
             Row(
@@ -613,12 +649,21 @@ private fun OnionHomeScreen(
                         enabled = canCreate,
                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.onBackground),
                     ) {
-                        Text(text = "+ 앱 추가")
+                        Icon(painter = painterResource(id = R.drawable.ic_add), contentDescription = null)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(text = "앱 추가")
                     }
                 }
             }
 
             if (hasApps) {
+                activeDrafts.forEach { draft ->
+                    GeneratingAppRow(
+                        draft = draft,
+                        onClick = { onOpenDraft(draft) },
+                        onCancel = { onCancelDraft(draft.id) },
+                    )
+                }
                 generationState.apps.forEach { app ->
                     SavedAppRow(
                         app = app,
@@ -722,9 +767,16 @@ private fun ToolSetupCard(
                     trackColor = MaterialTheme.colorScheme.surfaceVariant,
                 )
                 Text(
-                    text = strings.downloadingInBackground,
+                    text = state.downloadText(strings.downloadingInBackground),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (state.downloadStatus == DownloadStatus.Failed && state.statusMessage != null) {
+                Text(
+                    text = state.statusMessage,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
                 )
             }
 
@@ -742,6 +794,7 @@ private fun ToolSetupCard(
                             model = model,
                             selected = state.selectedModel == model,
                             recommended = state.recommendedModel == model,
+                            enabled = state.canChangeModel,
                             onClick = { onSelectModel(model) },
                         )
                     }
@@ -768,10 +821,11 @@ private fun ModelRow(
     model: AppCreationToolModel,
     selected: Boolean,
     recommended: Boolean,
+    enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
     Surface(
-        modifier = Modifier.clickable(onClick = onClick),
+        modifier = Modifier.clickable(enabled = enabled, onClick = onClick),
         color = Color.Transparent,
         shape = RoundedCornerShape(12.dp),
     ) {
@@ -787,7 +841,7 @@ private fun ModelRow(
                 Text(
                     text = strings.modelDescription(model),
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (enabled) 1f else 0.48f),
                 )
             }
             if (recommended) {
@@ -902,7 +956,9 @@ private fun EmptyAppsState(
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.onBackground),
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text(text = "+ 첫 앱 추가하기")
+                Icon(painter = painterResource(id = R.drawable.ic_add), contentDescription = null)
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(text = "첫 앱 추가하기")
             }
             if (!enabled) {
                 Text(
@@ -949,10 +1005,52 @@ private fun SavedAppRow(
                     onClick = onEdit,
                     enabled = editEnabled,
                 ) {
+                    Icon(painter = painterResource(id = R.drawable.ic_edit), contentDescription = null)
+                    Spacer(modifier = Modifier.width(6.dp))
                     Text(text = "수정")
                 }
                 OutlinedButton(onClick = onDelete) {
+                    Icon(painter = painterResource(id = R.drawable.ic_delete), contentDescription = null)
+                    Spacer(modifier = Modifier.width(6.dp))
                     Text(text = "삭제")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GeneratingAppRow(
+    draft: GeneratedAppDraft,
+    onClick: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    Surface(
+        onClick = onClick,
+        color = MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(18.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = "${draft.title} ${if (draft.status == GenerationStatus.Queued) "대기중" else "생성중"}",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                text = draft.progressLabel,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = onCancel) {
+                    Icon(painter = painterResource(id = R.drawable.ic_cancel), contentDescription = null)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(text = "취소")
                 }
             }
         }
@@ -1063,6 +1161,8 @@ private fun AppCreateScreen(
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.onBackground),
             ) {
+                Icon(painter = painterResource(id = R.drawable.ic_add), contentDescription = null)
+                Spacer(modifier = Modifier.width(6.dp))
                 Text(text = "생성")
             }
         }
@@ -1114,6 +1214,111 @@ private fun SwitchRow(
 }
 
 @Composable
+private fun OnionBottomBar(
+    selected: AppDestination,
+    onOpenMarket: () -> Unit,
+    onOpenHome: () -> Unit,
+    onOpenSettings: () -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        shadowElevation = 8.dp,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            BottomNavItem(
+                icon = R.drawable.ic_market,
+                label = "마켓",
+                selected = selected == AppDestination.Market,
+                onClick = onOpenMarket,
+                modifier = Modifier.weight(1f),
+            )
+            BottomNavItem(
+                icon = R.drawable.ic_home,
+                label = "홈",
+                selected = selected == AppDestination.Home,
+                onClick = onOpenHome,
+                modifier = Modifier.weight(1f),
+            )
+            BottomNavItem(
+                icon = R.drawable.ic_settings,
+                label = "설정",
+                selected = selected == AppDestination.Settings,
+                onClick = onOpenSettings,
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+@Composable
+private fun BottomNavItem(
+    icon: Int,
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier,
+        onClick = onClick,
+        color = if (selected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
+        shape = RoundedCornerShape(18.dp),
+    ) {
+        Column(
+            modifier = Modifier.padding(vertical = 8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Icon(painter = painterResource(id = icon), contentDescription = label)
+            Text(text = label, style = MaterialTheme.typography.labelMedium, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
+        }
+    }
+}
+
+@Composable
+private fun MarketScreen(
+    onOpenHome: () -> Unit,
+    onOpenSettings: () -> Unit,
+) {
+    Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
+        bottomBar = {
+            OnionBottomBar(
+                selected = AppDestination.Market,
+                onOpenMarket = {},
+                onOpenHome = onOpenHome,
+                onOpenSettings = onOpenSettings,
+            )
+        },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(horizontal = 22.dp, vertical = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text(
+                text = "마켓",
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                text = "나중에 공유 앱과 리믹스를 둘 공간입니다.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
 private fun SettingsScreen(
     strings: OnionStrings,
     selectedLanguage: AppLanguage,
@@ -1122,12 +1327,22 @@ private fun SettingsScreen(
     onLanguageSelected: (AppLanguage) -> Unit,
     onThemeSelected: (AppThemeMode) -> Unit,
     onSelectModel: (AppCreationToolModel) -> Unit,
-    onStartDownload: suspend () -> Unit,
+    onStartDownload: () -> Unit,
     onBack: () -> Unit,
+    onOpenHome: () -> Unit,
+    onOpenMarket: () -> Unit,
 ) {
-    val scope = rememberCoroutineScope()
-
-    Scaffold(containerColor = MaterialTheme.colorScheme.background) { padding ->
+    Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
+        bottomBar = {
+            OnionBottomBar(
+                selected = AppDestination.Settings,
+                onOpenMarket = onOpenMarket,
+                onOpenHome = onOpenHome,
+                onOpenSettings = {},
+            )
+        },
+    ) { padding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -1138,6 +1353,8 @@ private fun SettingsScreen(
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 OutlinedButton(onClick = onBack) {
+                    Icon(painter = painterResource(id = R.drawable.ic_back), contentDescription = null)
+                    Spacer(modifier = Modifier.width(6.dp))
                     Text(text = "닫기")
                 }
                 Spacer(modifier = Modifier.width(12.dp))
@@ -1154,9 +1371,7 @@ private fun SettingsScreen(
                 showSettings = true,
                 onToggleSettings = {},
                 onSelectModel = onSelectModel,
-                onStartDownload = {
-                    scope.launch { onStartDownload() }
-                },
+                onStartDownload = onStartDownload,
                 showToggleButton = false,
             )
 
@@ -1182,22 +1397,12 @@ private fun SettingsScreen(
                 }
             }
 
-            SettingGroup(title = "앱 생성 도구") {
-                AppCreationToolModel.entries.forEach { model ->
-                    ModelRow(
-                        strings = strings,
-                        model = model,
-                        selected = toolState.selectedModel == model,
-                        recommended = toolState.recommendedModel == model,
-                        onClick = { onSelectModel(model) },
-                    )
-                }
-            }
-
             OutlinedButton(
                 onClick = {},
                 modifier = Modifier.fillMaxWidth(),
             ) {
+                Icon(painter = painterResource(id = R.drawable.ic_settings), contentDescription = null)
+                Spacer(modifier = Modifier.width(6.dp))
                 Text(text = "버전 확인")
             }
         }
@@ -1208,12 +1413,19 @@ private fun SettingsScreen(
 private fun AppPreviewScreen(
     draft: GeneratedAppDraft?,
     savedApp: SavedMiniApp?,
+    onCancelDraft: () -> Unit,
     onBack: () -> Unit,
 ) {
     val title = draft?.title ?: savedApp?.title ?: "새 앱"
     val html = draft?.html ?: savedApp?.html.orEmpty()
     val status = draft?.status ?: GenerationStatus.Done
     val isSavedApp = savedApp != null && draft == null
+    val hasPreviewHtml = html.isNotBlank()
+    val titleText = when {
+        draft != null && draft.title.isBlank() -> "앱 이름을 정하는 중..."
+        status == GenerationStatus.Done -> "$title 앱 생성 완료"
+        else -> "$title 앱 생성중..."
+    }
 
     if (isSavedApp) {
         Box(modifier = Modifier.fillMaxSize()) {
@@ -1244,7 +1456,7 @@ private fun AppPreviewScreen(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "$title 앱 ${if (status == GenerationStatus.Done) "생성 완료" else "생성중..."}",
+                        text = titleText,
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
                     )
@@ -1254,28 +1466,54 @@ private fun AppPreviewScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                OutlinedButton(onClick = onBack) {
-                    Text(text = "홈")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (status == GenerationStatus.Generating || status == GenerationStatus.Queued) {
+                        OutlinedButton(onClick = onCancelDraft) {
+                            Icon(painter = painterResource(id = R.drawable.ic_cancel), contentDescription = null)
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(text = "취소")
+                        }
+                    }
+                    OutlinedButton(onClick = onBack) {
+                        Icon(painter = painterResource(id = R.drawable.ic_home), contentDescription = null)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(text = "홈")
+                    }
                 }
             }
 
-            if (status == GenerationStatus.Generating) {
+            if (status == GenerationStatus.Generating || status == GenerationStatus.Queued) {
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             }
 
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                shape = RoundedCornerShape(24.dp),
-            ) {
-                Box(modifier = Modifier.padding(10.dp)) {
-                    HtmlPreview(
-                        html = html,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .clip(RoundedCornerShape(18.dp)),
+            if (hasPreviewHtml) {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    shape = RoundedCornerShape(24.dp),
+                ) {
+                    Box(modifier = Modifier.padding(10.dp)) {
+                        HtmlPreview(
+                            html = html,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .clip(RoundedCornerShape(18.dp)),
+                        )
+                    }
+                }
+            } else {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = draft?.progressLabel ?: "AI가 계획 중이에요",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             }
@@ -1327,12 +1565,31 @@ private fun StatusDot(status: DownloadStatus) {
         DownloadStatus.NotDownloaded -> MaterialTheme.colorScheme.outline
         DownloadStatus.Downloading -> MaterialTheme.colorScheme.primary
         DownloadStatus.Ready -> MaterialTheme.colorScheme.tertiary
+        DownloadStatus.Failed -> MaterialTheme.colorScheme.error
     }
     Box(
         modifier = Modifier
             .size(12.dp)
             .background(color = color, shape = CircleShape),
     )
+}
+
+private fun AppCreationToolState.downloadText(fallback: String): String {
+    if (downloadedBytes <= 0L) return statusMessage ?: fallback
+    val downloaded = downloadedBytes.toReadableSize()
+    val total = totalBytes.takeIf { it > 0L }?.toReadableSize()
+    return if (total == null) {
+        "${statusMessage ?: fallback} · $downloaded"
+    } else {
+        "${statusMessage ?: fallback} · $downloaded / $total"
+    }
+}
+
+private fun Long.toReadableSize(): String {
+    val gb = this / 1_073_741_824.0
+    if (gb >= 1.0) return String.format("%.1fGB", gb)
+    val mb = this / 1_048_576.0
+    return String.format("%.0fMB", mb)
 }
 
 private data class IntroPage(
@@ -1437,6 +1694,7 @@ private data class OnionStrings(
                     DownloadStatus.NotDownloaded -> "필요할 때 받을 수 있습니다"
                     DownloadStatus.Downloading -> "${(it.progress * 100).toInt()}% 준비됨"
                     DownloadStatus.Ready -> "앱 만들 준비 완료"
+                    DownloadStatus.Failed -> "준비 실패. 다시 시도해주세요"
                 }
             },
             modelDescription = {
@@ -1500,6 +1758,7 @@ private data class OnionStrings(
                     DownloadStatus.NotDownloaded -> "Available when you need it"
                     DownloadStatus.Downloading -> "${(it.progress * 100).toInt()}% ready"
                     DownloadStatus.Ready -> "Ready to create apps"
+                    DownloadStatus.Failed -> "Setup failed. Try again"
                 }
             },
             modelDescription = {
@@ -1563,6 +1822,7 @@ private data class OnionStrings(
                     DownloadStatus.NotDownloaded -> "必要な時に入手できます"
                     DownloadStatus.Downloading -> "${(it.progress * 100).toInt()}% 準備完了"
                     DownloadStatus.Ready -> "アプリ作成の準備完了"
+                    DownloadStatus.Failed -> "準備に失敗しました。再試行してください"
                 }
             },
             modelDescription = {
@@ -1626,6 +1886,7 @@ private data class OnionStrings(
                     DownloadStatus.NotDownloaded -> "需要时可以获取"
                     DownloadStatus.Downloading -> "已准备 ${(it.progress * 100).toInt()}%"
                     DownloadStatus.Ready -> "已准备好创建应用"
+                    DownloadStatus.Failed -> "准备失败，请重试"
                 }
             },
             modelDescription = {
@@ -1652,9 +1913,12 @@ private fun OnionHomeScreenPreview() {
             ),
             generationState = AppGenerationState(),
             onAddApp = {},
+            onOpenDraft = {},
             onOpenApp = {},
             onEditApp = {},
             onDeleteApp = {},
+            onCancelDraft = {},
+            onOpenMarket = {},
             onOpenSettings = {},
         )
     }
